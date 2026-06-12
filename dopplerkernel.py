@@ -1,5 +1,5 @@
 import numpy as np
-from scipy import signal, stats
+from scipy import signal, stats, constants, interpolate
 from numba import njit, prange
 from matplotlib import pylab as plt
 
@@ -237,7 +237,59 @@ def calculate_weight_mask(orbital_phase, w_0, peak_shift_longitude, peak_shift_l
         weight_mask = np.where(inside, weight_mask * dayside_weight, weight_mask)
     
     return weight_mask
-    
+
+#############################################################################
+#############################################################################
+@njit(parallel=True, fastmath=True)
+def inner_product(map1, map2):
+    n_rows = map1.shape[0]
+    n_cols = map1.shape[1]
+    result = np.zeros(n_rows)
+
+    for i in prange(n_rows):
+        mean1 = map1[i, :].mean()
+        mean2 = map2[i, :].mean()
+        s = 0.0
+        for j in range(n_cols):
+            s += (map1[i, j] - mean1) * (map2[i, j] - mean2)
+        result[i] = s
+
+    return result
+
+#############################################################################
+#############################################################################
+@njit(parallel=True, cache=True)
+def return_kpvsys_map(kp_array, vsys_array, selected_phases, CC_map_velocities, CC_map, first_idx):
+    n_kp = len(kp_array)
+    n_vsys = len(vsys_array)
+    n_phases = len(selected_phases)
+    n_vel = len(CC_map_velocities)
+    kpvsys_map = np.zeros((n_kp, n_vsys))
+
+    for i in prange(n_kp):
+        kp = kp_array[i]
+        for j in range(n_vsys):
+            vsys = vsys_array[j]
+            CC_sum = 0.0
+            for k in range(n_phases):
+                phase = selected_phases[k]
+                RV = vsys + kp * np.sin(2*np.pi*phase)
+                # manual np.interp with left/right = 0
+                row = CC_map[first_idx + k, :]
+                if RV <= CC_map_velocities[0] or RV >= CC_map_velocities[-1]:
+                    val = 0.0
+                else:
+                    idx = np.searchsorted(CC_map_velocities, RV) - 1
+                    x0 = CC_map_velocities[idx]
+                    x1 = CC_map_velocities[idx+1]
+                    y0 = row[idx]
+                    y1 = row[idx+1]
+                    val = y0 + (y1 - y0) * (RV - x0) / (x1 - x0)
+                CC_sum += val
+            kpvsys_map[i, j] = CC_sum
+
+    return kpvsys_map
+   
 #############################################################################
 #############################################################################
 class DopplerKernel():
@@ -265,7 +317,7 @@ class DopplerKernel():
         # Default center-to-limb weight
         self.w_0 = 0.
 
-        self.c = 299792.458  # km/s
+        self.c = 1e-3*constants.c # km/s
         
     ################################################################
     ################################################################
@@ -465,3 +517,207 @@ class DopplerKernel():
             print("Relative flux difference convolution:", (F_after - F_before) / F_before)
 
         return flux_conv
+    
+    ################################################################
+    ################################################################
+    def calculate_cross_correlation_map(self, wavelength, flux, velo_min=-50., velo_max=50., velo_step=1., max_scale_factor_phase=0.5):
+
+        n_phases = 25 # number of phases
+        n_wlen = len(wavelength) # number of wavelength points
+        n_velo = int((velo_max-velo_min)/velo_step)+1 # number of RV points
+
+        velo_array = np.linspace(velo_min, velo_max, n_velo)
+        phase_array = np.linspace(0.2, 0.8, n_phases)
+
+        dx = velo_array[1] - velo_array[0]
+        dy = phase_array[1] - phase_array[0]
+        
+        self.CC_map_phases = phase_array
+        self.CC_map_velocities = velo_array
+        self.CC_map = np.zeros((n_phases, n_velo))
+
+        self.CC_map_x_edges = np.r_[velo_array - dx/2, velo_array[-1] + dx/2] # for plotting with pcolormesh
+        self.CC_map_y_edges = np.r_[phase_array - dy/2, phase_array[-1] + dy/2] # for plotting with pcolormesh
+        
+        template_spline_object = interpolate.splrep(wavelength, flux, s=0.0)
+
+        matrix_template = np.zeros((n_phases, n_wlen))
+        matrix_data = np.zeros((n_phases, n_wlen))
+
+        print('Calculating Doppler-broadened spectra at each phase...')
+
+        # Loop through phases to obtain Doppler-shifted spectra
+        for i, phase in enumerate(phase_array):
+
+            # For every phase, calculate the line-of-sight velcity field...
+            self.make_velocity_field(orbital_phase=phase, v_rot=self.v_rot, v_wind=self.v_wind, \
+                        sink_longitude=self.sink_longitude, v_jet=self.v_jet, sigma_jet=self.sigma_jet)
+            
+            # ... and the corresponding weight function
+            self.make_weight_mask(orbital_phase=self.orbital_phase, w_0=self.w_0, peak_shift_longitude=self.peak_shift_longitude, \
+                        peak_shift_latitude=self.peak_shift_latitude, peak_dropoff=self.peak_dropoff, nightside_zero=self.nightside_zero, \
+                        advanced_mask=self.advanced_mask)
+            
+            # Calculate the broadening kernel
+            self.calculate_doppler_kernel()
+
+            # Calculate the convolved spectrum
+            broadened_spectrum = self.convolve_with_spectrum(wavelength, flux)
+
+            # Apply the scale factor
+            if phase <= max_scale_factor_phase:
+                broadened_spectrum = broadened_spectrum * np.sin(0.5*np.pi*phase / (max_scale_factor_phase))**2
+            else:
+                broadened_spectrum = broadened_spectrum * np.cos(0.5*np.pi*(phase - max_scale_factor_phase) / (1. - max_scale_factor_phase))**2
+
+            # Store the boradened spectra as data
+            matrix_data[i,:] = broadened_spectrum
+        
+        print('Calculating cross-correlation map between', velo_min, 'and', velo_max, 'km/s...')
+        
+        # Loop through radial velocities to compute cross-correlation map
+        for i, RV in enumerate(velo_array):
+
+            shifted_wavelength = wavelength * (1.0 - RV/self.c)
+            shifted_template = interpolate.splev(shifted_wavelength, template_spline_object, der=0, ext=1)
+
+            matrix_template[:] = shifted_template
+
+            self.CC_map[:,i] = inner_product(matrix_data, matrix_template)
+        
+        # Normalize cross-correlation map
+        self.CC_map = self.CC_map / np.max(abs(self.CC_map))
+
+        print('Done.')
+    
+    ################################################################
+    ################################################################
+    def plot_cross_correlation_map(self, velo_range_min=None, velo_range_max=None):
+
+        if velo_range_min is None and velo_range_max is None:
+            self.velo_range_min = self.CC_map_velocities.min()
+            self.velo_range_max = self.CC_map_velocities.max()
+        else:
+            self.velo_range_min = velo_range_min
+            self.velo_range_max = velo_range_max
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        mesh = ax.pcolormesh(
+            self.CC_map_x_edges,
+            self.CC_map_y_edges,
+            self.CC_map,
+            cmap='Greens',
+            vmin=0,
+            vmax=1,
+            shading='flat'
+        )
+
+        cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
+        cbar.set_label('Cross-correlation (normalized)', fontsize=12)
+        ax.set_xlabel('Velocity [km/s]', fontsize=12)
+        ax.set_ylabel('Orbital phase', fontsize=12)
+
+        # Find velocity of max CC at each phase
+        x_centers = 0.5 * (self.CC_map_x_edges[:-1] + self.CC_map_x_edges[1:])
+        y_centers = 0.5 * (self.CC_map_y_edges[:-1] + self.CC_map_y_edges[1:])
+        max_idx = np.argmax(self.CC_map, axis=1)
+        v_max = x_centers[max_idx]
+        
+        ax.plot(v_max, y_centers, color='k', lw=3)
+
+        if velo_range_min is not None and velo_range_max is not None:
+            ax.set_xlim(velo_range_min, velo_range_max)
+
+        plt.tight_layout()
+        plt.show()
+    
+    ################################################################
+    ################################################################
+    def calculate_kpvsys_map(self, phi_1=0.25, phi_2=0.45, kp_min=-50., kp_max=50., kp_step=1., \
+                        vsys_min=-30, vsys_max=30, vsys_step=1.):
+        
+        n_kp = int((kp_max - kp_min) / kp_step) + 1
+        n_vsys = int((vsys_max - vsys_min) / vsys_step) + 1
+
+        self.kp_array = np.linspace(kp_min, kp_max, n_kp)
+        self.vsys_array = np.linspace(vsys_min, vsys_max, n_vsys)
+        self.kpvsys_map = np.zeros((n_kp, n_vsys))
+
+        self.kpvsys_map_x_edges = np.r_[self.vsys_array - vsys_step/2, self.vsys_array[-1] + vsys_step/2]
+        self.kpvsys_map_y_edges = np.r_[self.kp_array - kp_step/2, self.kp_array[-1] + kp_step/2]
+
+        print('Calculating Kp-vsys map between', kp_min, 'and', kp_max, 'km/s in Kp and between', vsys_min, 'and', vsys_max, 'km/s in vsys...')
+
+        self.selected_phases = self.CC_map_phases[(self.CC_map_phases >= phi_1) & (self.CC_map_phases <= phi_2)]
+        first_idx = np.flatnonzero((self.CC_map_phases >= phi_1) & (self.CC_map_phases <= phi_2))[0]
+
+        self.kpvsys_map = return_kpvsys_map(self.kp_array, self.vsys_array, self.selected_phases, self.CC_map_velocities, self.CC_map, first_idx)
+        self.kpvsys_map = self.kpvsys_map / np.max(self.kpvsys_map)
+
+        print('Done.')
+
+    ################################################################
+    ################################################################
+    def plot_kpvsys_map(self):
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+        # --- Kp-Vsys map ---
+        ax = axes[0]
+        mesh = ax.pcolormesh(
+            self.kpvsys_map_x_edges,
+            self.kpvsys_map_y_edges,
+            self.kpvsys_map,
+            cmap='magma',
+            vmin=0,
+            vmax=1,
+            shading='flat'
+        )
+        cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
+        cbar.set_label('Signal (normalized)', fontsize=12)
+        ax.set_xlabel('$v_{sys}$ [km/s]', fontsize=12)
+        ax.set_ylabel('$K_{p}$ [km/s]', fontsize=12)
+
+        # Find (Kp, Vsys) of maximum signal
+        x_centers = 0.5 * (self.kpvsys_map_x_edges[:-1] + self.kpvsys_map_x_edges[1:])
+        y_centers = 0.5 * (self.kpvsys_map_y_edges[:-1] + self.kpvsys_map_y_edges[1:])
+        max_idx = np.unravel_index(np.argmax(self.kpvsys_map), self.kpvsys_map.shape)
+        kp_max = y_centers[max_idx[0]]
+        vsys_max = x_centers[max_idx[1]]
+
+        ax.axhline(0, color='white', lw=1, ls='--')
+        ax.axvline(0, color='white', lw=1, ls='--')
+
+        ax.plot(vsys_max, kp_max, marker='o', color='orange', markeredgecolor='black', ms=10, mew=1.5)
+
+        # --- CCF map ---
+        ax2 = axes[1]
+        mesh2 = ax2.pcolormesh(
+            self.CC_map_x_edges,
+            self.CC_map_y_edges,
+            self.CC_map,
+            cmap='Greens',
+            vmin=0,
+            vmax=1,
+            shading='flat'
+        )
+
+        cbar2 = fig.colorbar(mesh2, ax=ax2, pad=0.02)
+        cbar2.set_label('Cross-correlation (normalized)', fontsize=12)
+        ax2.set_xlabel('Velocity [km/s]', fontsize=12)
+        ax2.set_ylabel('Orbital phase', fontsize=12)
+
+        ax2.set_xlim(self.velo_range_min, self.velo_range_max)
+
+        # Plot the sinusoid RV(phase) = vsys_max + kp_max * sin(2*pi*phase)
+        RV_sinusoid_selected_range = vsys_max + kp_max * np.sin(2*np.pi*self.selected_phases)
+        ax2.plot(RV_sinusoid_selected_range, self.selected_phases, color='orange', lw=5, label='selected phases')
+
+        phase_centers = 0.5 * (self.CC_map_y_edges[:-1] + self.CC_map_y_edges[1:])
+        RV_sinusoid_full_range = vsys_max + kp_max * np.sin(2*np.pi*phase_centers)
+
+        ax2.plot(RV_sinusoid_full_range, phase_centers, color='k', lw=2, ls='--', label='best-fit sinusoid')
+
+        ax2.legend(fontsize=12)
+
+        plt.tight_layout()
+        plt.show()
